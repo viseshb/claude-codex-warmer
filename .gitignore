@@ -1,0 +1,7 @@
+# Never commit local auth / secrets
+auth.json
+.codex/
+.claude/
+*.pem
+.env
+node_modules/

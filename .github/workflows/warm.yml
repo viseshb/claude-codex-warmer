@@ -1,0 +1,114 @@
+name: warm-usage-windows
+
+# Warms the rolling 5-hour usage windows for Claude Code (Pro/Max subscription)
+# and Codex (ChatGPT subscription) by sending one throwaway prompt each morning.
+# The 5h window starts on the FIRST message, so firing early = window ready at work start.
+#
+# Auth: subscription OAuth tokens only, NO API keys.
+#   - Claude: CLAUDE_CODE_OAUTH_TOKEN  (from `claude setup-token`)
+#   - Codex:  CODEX_AUTH_JSON          (contents of ~/.codex/auth.json after `codex login`)
+#
+# Schedule notes:
+#   - GitHub cron is UTC only, no DST. Two lines cover CDT (UTC-5) and CST (UTC-6).
+#   - GitHub scheduled runs are often 5-15 min late; that is fine for warming.
+#   - Scheduled workflows run ONLY on the default branch.
+
+on:
+  schedule:
+    - cron: "0 11 * * *"   # 06:00 CDT (summer)
+    - cron: "0 12 * * *"   # 06:00 CST (winter)  -- harmless extra warm during CDT
+  workflow_dispatch:        # manual "Run workflow" button
+
+# Least privilege by default; heartbeat job elevates to write.
+permissions:
+  contents: read
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Claude Code — uses your Pro/Max subscription via OAuth token. Solid path.
+  # --------------------------------------------------------------------------
+  warm-claude:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Send warm-up prompt
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          claude -p "Warm-up ping. Reply with: OK" \
+            --model claude-haiku-4-5-20251001
+
+  # --------------------------------------------------------------------------
+  # Codex — uses your ChatGPT subscription via restored auth.json.
+  # FRAGILE: refresh tokens can rotate/expire. We write the refreshed
+  # auth.json back to the secret after the run so cron keeps working.
+  # This write-back needs a PAT (secret GH_PAT) with 'secrets: write'.
+  # Without GH_PAT the run still works, but you may need to re-login and
+  # update CODEX_AUTH_JSON manually every few days.
+  # --------------------------------------------------------------------------
+  warm-codex:
+    runs-on: ubuntu-latest
+    env:
+      GH_PAT: ${{ secrets.GH_PAT }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex
+
+      - name: Restore Codex auth
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+        run: |
+          mkdir -p "$HOME/.codex"
+          printf '%s' "$CODEX_AUTH_JSON" > "$HOME/.codex/auth.json"
+          chmod 600 "$HOME/.codex/auth.json"
+
+      - name: Send warm-up prompt
+        run: |
+          codex exec \
+            -m gpt-5.4-mini \
+            -c model_reasoning_effort="low" \
+            "Warm-up ping. Reply with: OK"
+
+      - name: Persist refreshed auth back to secret (best-effort)
+        if: ${{ env.GH_PAT != '' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.GH_PAT }}
+        run: |
+          # Codex may have rotated the refresh token during the run.
+          # Push the updated auth.json back so the next cron run authenticates.
+          gh secret set CODEX_AUTH_JSON \
+            --repo "${{ github.repository }}" \
+            --body "$(cat "$HOME/.codex/auth.json")"
+
+  # --------------------------------------------------------------------------
+  # Heartbeat — one commit per run keeps the repo "active" so GitHub never
+  # auto-disables the schedule after 60 idle days. Runs even if warms fail.
+  # --------------------------------------------------------------------------
+  heartbeat:
+    needs: [warm-claude, warm-codex]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Commit timestamp
+        run: |
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > heartbeat.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add heartbeat.txt
+          git commit -m "chore: heartbeat $(cat heartbeat.txt)" || exit 0
+          git push
