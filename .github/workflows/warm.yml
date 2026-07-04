@@ -9,15 +9,19 @@ name: warm-usage-windows
 #   - Codex:  CODEX_AUTH_JSON          (contents of ~/.codex/auth.json after `codex login`)
 #
 # Schedule notes:
-#   - GitHub cron is UTC only, no DST. Two lines cover CDT (UTC-5) and CST (UTC-6).
+#   - GitHub cron is UTC only, no DST. Two trigger lines cover CDT (UTC-5) and
+#     CST (UTC-6); a runtime guard (TARGET_HOUR check below) makes sure only the
+#     one that actually lands at 6am Texas time sends real messages. The other
+#     trigger runs the job but skips the API call - exactly 2 calls/day total
+#     (1 Claude + 1 Codex), never 4.
 #   - GitHub scheduled runs are often 5-15 min late; that is fine for warming.
 #   - Scheduled workflows run ONLY on the default branch.
 
 on:
   schedule:
-    - cron: "0 11 * * *"   # 06:00 CDT (summer)
-    - cron: "0 12 * * *"   # 06:00 CST (winter)  -- harmless extra warm during CDT
-  workflow_dispatch:        # manual "Run workflow" button
+    - cron: "0 11 * * *"   # fires at 06:00 CDT / 05:00 CST
+    - cron: "0 12 * * *"   # fires at 07:00 CDT / 06:00 CST
+  workflow_dispatch:        # manual "Run workflow" button - always sends for real
 
 # Least privilege by default; heartbeat job elevates to write.
 permissions:
@@ -40,7 +44,13 @@ jobs:
       - name: Send warm-up prompt
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
+          hour=$(TZ="America/Chicago" date +%H)
+          if [ "$EVENT_NAME" = "schedule" ] && [ "$hour" != "06" ]; then
+            echo "Not 6am Texas time (local hour: $hour) - skipping, other cron line will fire for real."
+            exit 0
+          fi
           claude -p "hi" \
             --model claude-haiku-4-5-20251001
 
@@ -73,7 +83,14 @@ jobs:
           chmod 600 "$HOME/.codex/auth.json"
 
       - name: Send warm-up prompt
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
+          hour=$(TZ="America/Chicago" date +%H)
+          if [ "$EVENT_NAME" = "schedule" ] && [ "$hour" != "06" ]; then
+            echo "Not 6am Texas time (local hour: $hour) - skipping, other cron line will fire for real."
+            exit 0
+          fi
           codex exec \
             --skip-git-repo-check \
             -m gpt-5.4-mini \
