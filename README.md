@@ -5,7 +5,7 @@ Fires one throwaway prompt at **Claude Code** (Pro/Max subscription) and **Codex
 
 **Why:** both providers start their rolling **5-hour usage window on the first
 message**. Warming early means the window is already ticking when you sit down to
-work — and later resets land inside your workday.
+work and later resets land inside your workday.
 
 **No API keys.** Uses subscription OAuth tokens only.
 
