@@ -30,11 +30,13 @@ One workflow, three jobs:
 | `warm-codex` | Installs the Codex CLI, restores your ChatGPT login, sends `"hi"` to `gpt-5.4-mini` at low reasoning effort |
 | `heartbeat`  | Commits a timestamp file each run, so GitHub never auto-disables the schedule (see "60-day rule" below) |
 
-The schedule fires **twice** in UTC to cover both sides of Daylight Saving Time,
-but each job checks the real local hour at runtime and only sends a real message
-when it's actually your target hour — the other trigger is a harmless no-op. Net
-result: **exactly one Claude call + one Codex call per day**, always at the right
-local time, year-round, with zero manual DST bookkeeping.
+The schedule fires every 15 minutes across a wide early-morning UTC window (to
+survive GitHub's cron delay, which can run 60-90+ minutes late in practice, not
+the "5-15 min" the docs suggest). Each job checks a committed per-provider
+state file and only sends for real on the **first run of the calendar day**;
+every other trigger that day is a cheap no-op. Net result: **exactly one
+Claude call + one Codex call per day**, as early as GitHub actually gets to
+it — never zero, never more than one each.
 
 Manually triggering the workflow (`workflow_dispatch`) always sends for real,
 regardless of the time — useful for testing.
@@ -84,13 +86,14 @@ or a nested/agent session.
 
 ### 3. Set your local timezone in the workflow
 
-Both `warm-claude` and `warm-codex` jobs guard on:
+Both `warm-claude` and `warm-codex` jobs stamp their dedupe state with:
 ```bash
-hour=$(TZ="America/Chicago" date +%H)
+TZ="America/Chicago" date +%F
 ```
 Change `America/Chicago` to your [IANA timezone](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)
-(e.g. `America/New_York`, `Europe/London`, `Asia/Kolkata`), and change the `"06"`
-comparison to your target hour (24h, zero-padded).
+(e.g. `America/New_York`, `Europe/London`, `Asia/Kolkata`) in both jobs, and
+shift the `cron:` window (see "Schedule reference" below) so it brackets your
+target wake-up hour in UTC.
 
 ### 4. Test it
 
@@ -110,19 +113,31 @@ received a real message = window warmed.
 ```yaml
 on:
   schedule:
-    - cron: "0 11 * * *"
-    - cron: "0 12 * * *"
+    - cron: "*/15 9-13 * * *"   # every 15 min across a wide early-morning window
   workflow_dispatch:
 ```
 
-- GitHub Actions cron is **UTC-only** with no DST awareness — that's why there
-  are two lines an hour apart, one of which will always land on your target
-  local hour depending on the season. The runtime guard (`TZ=... date +%H`)
-  decides which one actually fires.
-- Adjust the two `cron:` lines so they bracket your target local hour in UTC
-  across both DST states. Format is `minute hour * * *`.
-- Scheduled runs are commonly 5–15 minutes late; don't rely on second-level
-  precision.
+GitHub's own docs say scheduled runs are "5-15 minutes late." In practice, on a
+low-traffic repo, we observed **60-90+ minutes** of delay on day one. A single
+fixed-time trigger cannot survive that — it either fires too late or, if you
+add a guard that checks the exact hour, the guard itself can end up rejecting
+every delayed run and nothing gets sent at all (this happened; see commit
+history).
+
+The fix used here: fire **every 15 minutes across a wide window**
+(`9-13` UTC = ~03:00-08:45 CDT / ~02:00-07:45 CST — comfortably brackets a
+6am-ish wake-up under heavy delay), and let each job's committed state file
+(`.state/claude-last-warm.txt`, `.state/codex-last-warm.txt`) decide whether
+today's real message has already gone out. The first run of the day that
+actually executes sends for real and records today's date; every other
+trigger that day is a ~5 second no-op (checkout + date compare, nothing
+installed, no API call). Net effect: **exactly one real Claude call + one
+real Codex call per calendar day**, as early as GitHub actually runs the
+workflow — never zero, never more than one each.
+
+To retarget: shift the `9-13` hour range in UTC so it brackets your desired
+local wake-up time with a few hours of slack in both directions, and update
+the `TZ="America/Chicago"` timezone in both jobs (see step 3 above).
 
 ---
 

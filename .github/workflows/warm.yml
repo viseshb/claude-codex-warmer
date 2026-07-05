@@ -9,21 +9,28 @@ name: warm-usage-windows
 #   - Codex:  CODEX_AUTH_JSON          (contents of ~/.codex/auth.json after `codex login`)
 #
 # Schedule notes:
-#   - GitHub cron is UTC only, no DST. Two trigger lines cover CDT (UTC-5) and
-#     CST (UTC-6); a runtime guard (TARGET_HOUR check below) makes sure only the
-#     one that actually lands at 6am Texas time sends real messages. The other
-#     trigger runs the job but skips the API call - exactly 2 calls/day total
-#     (1 Claude + 1 Codex), never 4.
-#   - GitHub scheduled runs are often 5-15 min late; that is fine for warming.
+#   - GitHub cron is UTC only, no DST, and is best-effort: scheduled runs on a
+#     low-traffic repo have been observed running 60-90+ min late, not the
+#     "5-15 min" GitHub's own docs suggest. A single fixed-hour trigger is not
+#     reliable enough to hit a target wake-up time.
+#   - Fix: fire every 15 min across a wide early-morning UTC window, but each
+#     job checks a committed per-provider state file first and only sends for
+#     real once per calendar day (target timezone). Every other run that day
+#     is a ~5s no-op (checkout + date check, nothing installed). This
+#     guarantees exactly one real Claude call + one real Codex call per day,
+#     as early as GitHub actually gets around to running the workflow,
+#     regardless of how many times the cron fires or how late it runs.
+#   - Manual `workflow_dispatch` always sends for real (bypasses the dedupe
+#     check) and updates the state file, so a manual test that morning
+#     correctly replaces that day's automatic send.
 #   - Scheduled workflows run ONLY on the default branch.
 
 on:
   schedule:
-    - cron: "0 11 * * *"   # fires at 06:00 CDT / 05:00 CST
-    - cron: "0 12 * * *"   # fires at 07:00 CDT / 06:00 CST
-  workflow_dispatch:        # manual "Run workflow" button - always sends for real
+    - cron: "*/15 9-13 * * *"   # every 15 min, 09:00-13:45 UTC = ~03:00-08:45 CDT/CST
+  workflow_dispatch:              # manual "Run workflow" button - always sends for real
 
-# Least privilege by default; heartbeat job elevates to write.
+# Least privilege by default; jobs that commit state elevate to write.
 permissions:
   contents: read
 
@@ -33,26 +40,53 @@ jobs:
   # --------------------------------------------------------------------------
   warm-claude:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Check if already warmed today
+        id: check
+        run: |
+          today=$(TZ="America/Chicago" date +%F)
+          last=$(cat .state/claude-last-warm.txt 2>/dev/null || echo "")
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$last" = "$today" ]; then
+            echo "Already warmed Claude today ($today) - skipping duplicate run."
+            echo "send=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "send=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/setup-node@v4
+        if: steps.check.outputs.send == 'true'
         with:
           node-version: "20"
 
       - name: Install Claude Code CLI
+        if: steps.check.outputs.send == 'true'
         run: npm install -g @anthropic-ai/claude-code
 
       - name: Send warm-up prompt
+        if: steps.check.outputs.send == 'true'
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          EVENT_NAME: ${{ github.event_name }}
         run: |
-          hour=$(TZ="America/Chicago" date +%H)
-          if [ "$EVENT_NAME" = "schedule" ] && [ "$hour" != "06" ]; then
-            echo "Not 6am Texas time (local hour: $hour) - skipping, other cron line will fire for real."
-            exit 0
-          fi
           claude -p "hi" \
             --model claude-haiku-4-5-20251001
+
+      - name: Record today as warmed
+        if: steps.check.outputs.send == 'true'
+        run: |
+          mkdir -p .state
+          TZ="America/Chicago" date +%F > .state/claude-last-warm.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .state/claude-last-warm.txt
+          git commit -m "chore: mark claude warmed $(cat .state/claude-last-warm.txt)" || exit 0
+          for i in 1 2 3; do
+            git pull --rebase --autostash && git push && break
+            sleep $((RANDOM % 5 + 1))
+          done
 
   # --------------------------------------------------------------------------
   # Codex — uses your ChatGPT subscription via restored auth.json.
@@ -64,17 +98,36 @@ jobs:
   # --------------------------------------------------------------------------
   warm-codex:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       GH_PAT: ${{ secrets.GH_PAT }}
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Check if already warmed today
+        id: check
+        run: |
+          today=$(TZ="America/Chicago" date +%F)
+          last=$(cat .state/codex-last-warm.txt 2>/dev/null || echo "")
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$last" = "$today" ]; then
+            echo "Already warmed Codex today ($today) - skipping duplicate run."
+            echo "send=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "send=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/setup-node@v4
+        if: steps.check.outputs.send == 'true'
         with:
           node-version: "20"
 
       - name: Install Codex CLI
+        if: steps.check.outputs.send == 'true'
         run: npm install -g @openai/codex
 
       - name: Restore Codex auth
+        if: steps.check.outputs.send == 'true'
         env:
           CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
         run: |
@@ -83,14 +136,8 @@ jobs:
           chmod 600 "$HOME/.codex/auth.json"
 
       - name: Send warm-up prompt
-        env:
-          EVENT_NAME: ${{ github.event_name }}
+        if: steps.check.outputs.send == 'true'
         run: |
-          hour=$(TZ="America/Chicago" date +%H)
-          if [ "$EVENT_NAME" = "schedule" ] && [ "$hour" != "06" ]; then
-            echo "Not 6am Texas time (local hour: $hour) - skipping, other cron line will fire for real."
-            exit 0
-          fi
           codex exec \
             --skip-git-repo-check \
             -m gpt-5.4-mini \
@@ -98,7 +145,7 @@ jobs:
             "hi"
 
       - name: Persist refreshed auth back to secret (best-effort)
-        if: ${{ env.GH_PAT != '' }}
+        if: ${{ steps.check.outputs.send == 'true' && env.GH_PAT != '' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ env.GH_PAT }}
@@ -108,6 +155,20 @@ jobs:
           gh secret set CODEX_AUTH_JSON \
             --repo "${{ github.repository }}" \
             --body "$(cat "$HOME/.codex/auth.json")"
+
+      - name: Record today as warmed
+        if: steps.check.outputs.send == 'true'
+        run: |
+          mkdir -p .state
+          TZ="America/Chicago" date +%F > .state/codex-last-warm.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .state/codex-last-warm.txt
+          git commit -m "chore: mark codex warmed $(cat .state/codex-last-warm.txt)" || exit 0
+          for i in 1 2 3; do
+            git pull --rebase --autostash && git push && break
+            sleep $((RANDOM % 5 + 1))
+          done
 
   # --------------------------------------------------------------------------
   # Heartbeat — one commit per run keeps the repo "active" so GitHub never
@@ -129,4 +190,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add heartbeat.txt
           git commit -m "chore: heartbeat $(cat heartbeat.txt)" || exit 0
-          git push
+          for i in 1 2 3; do
+            git pull --rebase --autostash && git push && break
+            sleep $((RANDOM % 5 + 1))
+          done
