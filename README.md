@@ -29,12 +29,13 @@ budget. Runs entirely on GitHub's servers; your machine can be off.
 ## How it works
 
 One workflow ([`.github/workflows/warm.yml`](.github/workflows/warm.yml)),
-three jobs:
+four jobs:
 
 | Job          | What it does |
 |--------------|--------------|
 | `warm-claude`| Installs the Claude Code CLI, sends `"hi"` to `claude-haiku-4-5` using your subscription OAuth token |
 | `warm-codex` | Installs the Codex CLI, restores your ChatGPT login, sends `"hi"` to `gpt-5.4-mini` at low reasoning effort |
+| `notify`     | If a warm job genuinely fails, opens one GitHub issue with the exact fix commands (GitHub emails you); auto-closes it once runs succeed again |
 | `heartbeat`  | Commits a timestamp once per day so GitHub never auto-disables the schedule (see FAQ) |
 
 The cron triggers every 30 minutes, 24/7. Each warm job reads a committed
@@ -51,6 +52,19 @@ Manually triggering the workflow (**Actions → warm-usage-windows → Run
 workflow**) always sends for real regardless of timing - that's your
 end-to-end test button.
 
+### Built to be left alone
+
+- **Warm-up calls retry 3x** with a short backoff before counting as failed,
+  so a transient network or API blip never surfaces as a failure.
+- **CLI versions are pinned** (`CLAUDE_CLI_VERSION` / `CODEX_CLI_VERSION` in
+  `warm.yml`) to the last verified-working releases, so an upstream update
+  can't silently break a flag the workflow depends on.
+- **Real failures notify you.** If a job still fails after retries - in
+  practice, a revoked token - the `notify` job opens a single GitHub issue
+  containing the copy-paste recovery commands. GitHub emails repo owners
+  about new issues by default, so the failure finds you; you never have to
+  poll the Actions tab. The issue auto-closes when a later run succeeds.
+
 ---
 
 ## Setup (10 minutes)
@@ -64,8 +78,8 @@ end-to-end test button.
   [GitHub CLI](https://cli.github.com) (`gh`) for setting secrets
 
 Only want one of the two providers? Delete the other job from `warm.yml`
-(and drop it from the `needs:` list of the `heartbeat` job) - they're fully
-independent.
+(and drop it from the `needs:` lists of the `notify` and `heartbeat` jobs) -
+they're fully independent.
 
 ### 1. Get your own copy of this repo
 
@@ -140,6 +154,9 @@ entry on wrong-account tokens.
 - **Models** - the warm-up uses the cheapest model on each side
   (`claude-haiku-4-5`, `gpt-5.4-mini` at low reasoning effort). Any model
   works; cheaper just wastes less of your own budget.
+- **CLI versions** - pinned via `CLAUDE_CLI_VERSION` and `CODEX_CLI_VERSION`
+  in `warm.yml`. To upgrade, bump the pin, run a manual test
+  (`gh workflow run warm.yml`), and confirm it's green before walking away.
 - **Timezone** - scheduling is epoch-based and timezone-independent. The
   `TZ='America/Chicago'` in the workflow only formats commit-message
   timestamps; change it for prettier logs, nothing else.
@@ -162,14 +179,23 @@ threshold re-warms and the chain self-corrects. If you message inside a gap,
 you start the window yourself - exactly what would happen without this repo,
 so you're never worse off.
 
+**How will I know if something breaks?**
+You'll get an email. A real failure (all retries exhausted) makes the
+`notify` job open a GitHub issue titled "Warm-up needs attention" with the
+exact recovery commands for whichever provider broke, and GitHub notifies
+repo owners about new issues by default. Fix the token, and the issue closes
+itself on the next successful run. No dashboard-watching required.
+
 **Codex suddenly stopped warming (401 errors).**
 OpenAI has no official CI token for Codex, so this repo restores
 `~/.codex/auth.json` from a secret. That file holds a refresh token which the
-OAuth server may rotate; on an ephemeral runner the rotated token is lost
-unless written back. Set the optional `GH_PAT` secret to enable automatic
-write-back, or re-run `codex login` locally and update `CODEX_AUTH_JSON` when
-it breaks. The Claude path doesn't have this problem - `claude setup-token`
-exists precisely for headless use.
+OAuth server may rotate or revoke; on an ephemeral runner a rotated token is
+lost unless written back. Set the optional `GH_PAT` secret to enable
+automatic write-back - without it, this failure is a matter of time (ours
+died after ~30 hours). When it does break: re-run `codex login` locally and
+update `CODEX_AUTH_JSON` (the failure issue contains these exact commands).
+The Claude path doesn't have this problem - `claude setup-token` exists
+precisely for headless use.
 
 **"hi" cost 4,577 tokens?!**
 Normal. Agent CLIs send their full system prompt, tool definitions, and
@@ -200,11 +226,11 @@ warmed account (desktop, phone, web, CLI) sees the same running window.
 
 ## Extending to other providers
 
-Copy the `warm-claude` job: install the provider's CLI, restore its auth from
-a secret, reuse the elapsed-time gate against a new
-`.state/<provider>-last-warm.txt`, and add the job to `heartbeat`'s `needs:`
-list. Any assistant with a headless CLI and subscription auth fits the
-pattern.
+Copy the `warm-claude` job: install the provider's CLI (pinned version),
+restore its auth from a secret, reuse the elapsed-time gate against a new
+`.state/<provider>-last-warm.txt`, and add the job to the `needs:` lists of
+`notify` and `heartbeat`. Any assistant with a headless CLI and subscription
+auth fits the pattern.
 
 ---
 
