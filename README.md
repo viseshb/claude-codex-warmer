@@ -1,193 +1,214 @@
 # LLM_Cron
 
-Keep your **Claude Code** and **Codex** subscription usage windows warm with a
-scheduled GitHub Actions cron — no laptop, no API keys, no extra billing.
+**Keep your Claude Code and Codex usage windows always warm — from a free GitHub
+Actions cron. No laptop, no API keys, no extra billing.**
 
-## Why this exists
+Both Claude (Anthropic Pro/Max subscription) and Codex (ChatGPT subscription)
+meter usage in a **rolling ~5-hour window that starts on your first message**.
+If the window only starts when you sit down and type, you burn the first part
+of every session just getting the clock going — and the reset lands at an
+awkward time.
 
-Both Claude Code (Anthropic subscription) and Codex (ChatGPT subscription) run
-usage on a **rolling window that starts on your first message** (commonly ~5
-hours). If that window only starts when you happen to sit down and type
-something, you waste the first chunk of it just getting started.
+LLM_Cron sends one tiny `"hi"` to each assistant **every ~5 hours, around the
+clock**. Each message starts a fresh window the moment the previous one
+expires, so whenever you open Claude or Codex, a window is already running.
 
-This repo re-sends one tiny "hi" to each assistant **every ~5 hours, around
-the clock** — each message starts a fresh window the moment the previous one
-expires, so a window is already running whenever you open the app, no matter
-what time of day you start working.
+Cost: ~5 messages per provider per day, each about 4,500 tokens (almost all of
+it the CLI's own system prompt) — a fraction of a percent of any window's
+budget. Runs entirely on GitHub's servers; your machine can be off.
 
-> **Why not just once each morning?** That was v1 of this repo, and it failed
-> in practice: a warm-up at 7am starts a window that *expires at noon*. Sit
-> down at 1pm and your first message starts a brand-new window anyway — the
-> morning warm did nothing. Since the window begins on the first message and
-> dies 5h later, the only way to have it "always ready" is to chain warms
-> back-to-back all day. Cost: ~5 trivial messages per provider per day, which
-> is noise against any subscription limit.
-
-**No API keys required.** Both jobs authenticate with your existing subscription
-(OAuth token / CLI login), not pay-per-token API billing.
+> **Why not one warm-up each morning?** That was v1, and it failed in practice:
+> a 7 AM warm-up starts a window that dies at noon. Sit down at 1 PM and your
+> first message starts a brand-new window anyway. Because a window can't be
+> extended or pre-booked — it starts on the first message *after* the previous
+> one expires — the only way to have it "always ready" is to chain warms
+> back-to-back all day.
 
 ---
 
 ## How it works
 
-One workflow, three jobs:
+One workflow ([`.github/workflows/warm.yml`](.github/workflows/warm.yml)),
+three jobs:
 
-| Job          | Does |
-|--------------|------|
-| `warm-claude`| Installs the Claude Code CLI, sends `"hi"` to `claude-haiku-4-5` using your subscription token |
+| Job          | What it does |
+|--------------|--------------|
+| `warm-claude`| Installs the Claude Code CLI, sends `"hi"` to `claude-haiku-4-5` using your subscription OAuth token |
 | `warm-codex` | Installs the Codex CLI, restores your ChatGPT login, sends `"hi"` to `gpt-5.4-mini` at low reasoning effort |
-| `heartbeat`  | Commits a timestamp file once per day, so GitHub never auto-disables the schedule (see "60-day rule" below) |
+| `heartbeat`  | Commits a timestamp once per day so GitHub never auto-disables the schedule (see FAQ) |
 
-The cron fires every 30 minutes, 24/7. Each warm job reads a committed
-per-provider state file (`.state/*-last-warm.txt`, epoch seconds) and only
-sends for real once the last warm is **more than 5h01m old** — i.e. strictly
-after the previous window has expired. Every other trigger is a ~5 second
-no-op (checkout + arithmetic, nothing installed, no API call).
+The cron triggers every 30 minutes, 24/7. Each warm job reads a committed
+state file (`.state/<provider>-last-warm.txt`, epoch seconds) and only sends
+for real once the previous warm is **more than 5 h 01 m old** — i.e. strictly
+after the previous window has expired. Every other trigger is a ~5-second
+no-op (checkout + one date comparison; nothing installed, no API call).
 
 The 1-minute margin matters: a message sent *before* the current window
 expires just counts inside it and does **not** start a new window — it would
-be a wasted send that silently breaks the chain. Sending strictly after
-expiry guarantees each warm opens a fresh window.
+be a wasted send that silently breaks the chain.
 
-Manually triggering the workflow (`workflow_dispatch`) always sends for real,
-regardless of elapsed time — useful for testing.
+Manually triggering the workflow (**Actions → warm-usage-windows → Run
+workflow**) always sends for real regardless of timing — that's your
+end-to-end test button.
 
 ---
 
-## Setup
+## Setup (10 minutes)
 
-### 1. Use this repo
-Click **Use this template** (or fork/clone) and push it to your own GitHub account.
-It must be its **own repository** — scheduled workflows only run on the default
-branch of the repo that defines them. Keep it **public** if you want unlimited
-Actions minutes (a private repo burns through the free tier at this trigger
-frequency).
+### 0. Prerequisites
+
+- A GitHub account
+- A Claude **Pro or Max** subscription (for `warm-claude`)
+- A ChatGPT subscription with **Codex** access (for `warm-codex`)
+- The `claude` and/or `codex` CLIs installed locally, plus the
+  [GitHub CLI](https://cli.github.com) (`gh`) for setting secrets
+
+Only want one of the two providers? Delete the other job from `warm.yml`
+(and drop it from the `needs:` list of the `heartbeat` job) — they're fully
+independent.
+
+### 1. Get your own copy of this repo
+
+Click **Use this template** (or fork it). It must be its **own repository** —
+GitHub only runs scheduled workflows from the default branch of the repo that
+defines them. Keep the repo **public** if you want unlimited free Actions
+minutes; on a private repo this trigger frequency will eat the free tier.
+
+### 2. Add your secrets
+
+> ⚠️ **The single most common failure:** minting a token while logged into a
+> different account than the one you actually use. The warm-up then happily
+> heats *someone else's* window every day while yours stays cold, and every
+> run still shows green. Before running the commands below, make sure the CLI
+> is logged into the **same account** your Claude/Codex apps use.
 
 ```bash
-git clone <your-fork-url>
-cd LLM_Cron
-git push origin main
-```
-
-### 2. Add secrets
-
-Repo → **Settings → Secrets and variables → Actions → New repository secret**.
-
-| Secret                    | Required | How to get it |
-|---------------------------|----------|----------------|
-| `CLAUDE_CODE_OAUTH_TOKEN` | yes      | `claude setup-token` (run locally in a real terminal — opens a browser) |
-| `CODEX_AUTH_JSON`         | yes      | `codex login` (run locally — opens a browser), then copy `~/.codex/auth.json` |
-| `GH_PAT`                  | optional | Personal Access Token with **Contents: read/write** on this repo — lets the Codex job write back its refreshed token (see "Codex fragility" below) |
-
-Setting them:
-
-```bash
-# Claude — run setup-token in your OWN terminal, not through an agent/CI shell
+# Claude — run in YOUR terminal (opens a browser; approve with the right account)
 claude setup-token
-gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo <owner>/<repo>
+gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo <you>/<repo>
+# paste the sk-ant-oat... token when prompted
 
-# Codex — run login in your OWN terminal
+# Codex — run in YOUR terminal (opens a browser; log in with the right account)
 codex login
-gh secret set CODEX_AUTH_JSON --repo <owner>/<repo> < ~/.codex/auth.json
-# PowerShell equivalent (no `<` redirection support):
-# Get-Content -Raw "$env:USERPROFILE\.codex\auth.json" | gh secret set CODEX_AUTH_JSON --repo <owner>/<repo>
+gh secret set CODEX_AUTH_JSON --repo <you>/<repo> < ~/.codex/auth.json
 ```
 
-`setup-token` / `login` need a real interactive terminal (they open a browser and
-wait for the OAuth callback) — they will hang if run from a non-interactive shell
-or a nested/agent session.
+PowerShell equivalent for the Codex line (no `<` redirection):
 
-### 3. (Optional) Timezone
+```powershell
+Get-Content -Raw "$env:USERPROFILE\.codex\auth.json" | gh secret set CODEX_AUTH_JSON --repo <you>/<repo>
+```
 
-The warm gate is epoch-based and **timezone-independent** — nothing to
-configure for scheduling. The `TZ='America/Chicago'` in the workflow only
-formats commit messages; change it if you want those stamps in your local time.
+Both commands need a real interactive terminal — they open a browser and wait
+for an OAuth callback, so they hang inside CI shells or agent sessions.
 
-### 4. Test it
+| Secret                    | Required | Notes |
+|---------------------------|----------|-------|
+| `CLAUDE_CODE_OAUTH_TOKEN` | for Claude | From `claude setup-token`. Valid ~1 year. |
+| `CODEX_AUTH_JSON`         | for Codex  | Contents of `~/.codex/auth.json` after `codex login`. Can expire — see FAQ. |
+| `GH_PAT`                  | optional   | Fine-grained PAT with **Secrets: read/write** on this repo; lets the Codex job write its refreshed token back so the login survives rotation. |
+
+### 3. Test it
 
 ```bash
-gh workflow run warm.yml --repo <owner>/<repo>
-gh run watch --repo <owner>/<repo>
+gh workflow run warm.yml --repo <you>/<repo>
+gh run watch --repo <you>/<repo>
 ```
 
-Manual runs always send for real, so this is a true end-to-end test regardless
-of the current time. Green `warm-claude` + `warm-codex` = both subscriptions
-received a real message = window warmed.
+Manual runs always send for real. Green `warm-claude` + `warm-codex` means
+both accounts just received a message and their windows are running.
+
+### 4. Verify it's hitting *your* account
+
+The next morning, open Claude **before typing anything**. You should see a
+session already in progress at 0% used, with a reset time that is *not* five
+hours from now. If you still get "send a message to start" — see the FAQ
+entry on wrong-account tokens.
 
 ---
 
-## Schedule reference
+## Configuration
 
-```yaml
-on:
-  schedule:
-    - cron: "*/30 * * * *"   # every 30 min, 24/7 — elapsed-time gate limits real sends to ~5/day
-  workflow_dispatch:
-```
-
-GitHub cron is best-effort: on a low-traffic repo, scheduled runs get skipped
-or land 60-90+ minutes late (observed; their docs claim "5-15 minutes"). With
-an elapsed-time gate that's harmless — whichever run lands first after the
-5h01m threshold sends for real and records the new timestamp, and the chain
-self-corrects. Worst case, a heavily delayed slot leaves a gap of roughly the
-delay between one window expiring and the next warm; your own first message
-would start a window in that gap exactly as it would without this repo, so
-you never end up worse off.
-
-State lives in `.state/claude-last-warm.txt` and `.state/codex-last-warm.txt`
-as epoch seconds, committed after each real send.
+- **Warm interval** — `WARM_INTERVAL_SECONDS` in `warm.yml` (default `18060`
+  = 5 h 01 m). Don't set it below your provider's window length: a send that
+  lands inside a still-active window is wasted and breaks the chain.
+- **Quiet hours** — to skip overnight warms, narrow the cron (e.g.
+  `*/30 12-23,0-4 * * *` ≈ 7 AM–11 PM US Central; GitHub cron is UTC). The
+  elapsed-time gate self-corrects whenever triggers resume. The trade-off:
+  your first window of the day starts at the first morning trigger instead of
+  already running from overnight.
+- **Models** — the warm-up uses the cheapest model on each side
+  (`claude-haiku-4-5`, `gpt-5.4-mini` at low reasoning effort). Any model
+  works; cheaper just wastes less of your own budget.
+- **Timezone** — scheduling is epoch-based and timezone-independent. The
+  `TZ='America/Chicago'` in the workflow only formats commit-message
+  timestamps; change it for prettier logs, nothing else.
 
 ---
 
-## The 60-day auto-disable rule
+## FAQ / Troubleshooting
 
-GitHub automatically disables a scheduled workflow after **60 days with no
-repository activity**. A repo whose only purpose is running cron jobs would
-otherwise silently stop with no error. The warm jobs already commit ~5x/day,
-but the `heartbeat` job commits a timestamp once per day even when both warm
-jobs fail — so the schedule stays alive (and failures stay visible) no matter
-what.
+**Every run is green but my window is never warm.**
+Your token was almost certainly minted from a different account than the one
+your apps use (multiple Google logins are the classic cause). The runs really
+are sending — to the wrong account, which no log can show you. Re-mint the
+secret from a terminal where the CLI is logged into the account you actually
+use (step 2), then re-verify (step 4).
 
----
+**Why is there sometimes a short gap right after a window expires?**
+GitHub's cron is best-effort — on low-traffic repos, triggers regularly land
+30–90 minutes late or get skipped. Whichever run lands first after the 5 h 01 m
+threshold re-warms and the chain self-corrects. If you message inside a gap,
+you start the window yourself — exactly what would happen without this repo,
+so you're never worse off.
 
-## Codex fragility (read before relying on this)
+**Codex suddenly stopped warming (401 errors).**
+OpenAI has no official CI token for Codex, so this repo restores
+`~/.codex/auth.json` from a secret. That file holds a refresh token which the
+OAuth server may rotate; on an ephemeral runner the rotated token is lost
+unless written back. Set the optional `GH_PAT` secret to enable automatic
+write-back, or re-run `codex login` locally and update `CODEX_AUTH_JSON` when
+it breaks. The Claude path doesn't have this problem — `claude setup-token`
+exists precisely for headless use.
 
-Anthropic ships `claude setup-token` specifically for headless/CI use — that
-path is solid. OpenAI has **no equivalent** for Codex; there's no official
-"subscription token for CI." This repo works around that by restoring
-`~/.codex/auth.json` from a secret each run.
+**"hi" cost 4,577 tokens?!**
+Normal. Agent CLIs send their full system prompt, tool definitions, and
+environment context with every request; your one-word prompt rides on top.
+It's the floor cost of any real message, and it's under 1% of a window.
 
-That file contains a short-lived access token and a refresh token. When Codex
-refreshes the access token, the OAuth server may **rotate** the refresh token,
-invalidating the old one. Since CI runners are ephemeral, a rotated token is
-lost unless something writes it back — so `warm-codex` does that automatically
-via `GH_PAT`, if you set it.
+**Will this stop working if I don't touch the repo for two months?**
+No — that's what `heartbeat` is for. GitHub disables scheduled workflows
+after 60 days without repository activity; the daily heartbeat commit counts
+as activity and also keeps job failures visible.
 
-- **With `GH_PAT`:** should keep authenticating indefinitely.
-- **Without `GH_PAT`:** if the refresh token turns out to be single-use, you'll
-  need to re-run `codex login` and update `CODEX_AUTH_JSON` every so often.
-
-If this proves too flaky for your use, delete the `warm-codex` job — `warm-claude`
-is fully independent and doesn't share this problem.
+**Does this work for all my devices?**
+Yes. Windows live on the *account*, not the device. Every app logged into the
+warmed account (desktop, phone, web, CLI) sees the same running window.
 
 ---
 
 ## Security notes
 
-- No API keys, no long-lived plaintext credentials in the repo — only encrypted
-  GitHub Actions secrets.
-- `.gitignore` blocks local `auth.json` / `.env` / credential files from ever
-  being committed.
-- GitHub automatically masks secret values in Action logs.
-- Consider adding a branch protection ruleset on `main` (Settings → Rules →
-  Rulesets) blocking force-push and deletion, since the workflow pushes
-  directly to it.
+- No API keys and no plaintext credentials in the repo — auth lives only in
+  encrypted GitHub Actions secrets, and GitHub masks secret values in logs.
+- [`.gitignore`](.gitignore) blocks local `auth.json` / `.env` / credential
+  files from ever being committed.
+- The workflow pushes state commits to `main`; consider a ruleset
+  (Settings → Rules → Rulesets) blocking force-push and branch deletion.
 
 ---
 
-## Extending
+## Extending to other providers
 
-Add another scheduled assistant/provider by copying the `warm-claude` job:
-install its CLI, restore its auth from a secret, reuse the same elapsed-time
-gate against a new `.state/<provider>-last-warm.txt` file, and list it in
-`needs:` on the `heartbeat` job.
+Copy the `warm-claude` job: install the provider's CLI, restore its auth from
+a secret, reuse the elapsed-time gate against a new
+`.state/<provider>-last-warm.txt`, and add the job to `heartbeat`'s `needs:`
+list. Any assistant with a headless CLI and subscription auth fits the
+pattern.
+
+---
+
+## License
+
+[MIT](LICENSE) — use it, fork it, ship it. Attribution appreciated, not
+required.
