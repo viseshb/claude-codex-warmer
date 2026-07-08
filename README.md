@@ -1,4 +1,4 @@
-# LLM_Cron
+# claude-codex-warmer
 
 **Keep your Claude Code and Codex usage windows always warm - from a free GitHub
 Actions cron. No laptop, no API keys, no extra billing.**
@@ -9,7 +9,7 @@ If the window only starts when you sit down and type, you burn the first part
 of every session just getting the clock going - and the reset lands at an
 awkward time.
 
-LLM_Cron sends one tiny `"hi"` to each assistant **every ~5 hours, around the
+claude-codex-warmer sends one tiny `"hi"` to each assistant **every ~5 hours, around the
 clock**. Each message starts a fresh window the moment the previous one
 expires, so whenever you open Claude or Codex, a window is already running.
 
