@@ -29,13 +29,25 @@ name: warm-usage-windows
 #   - Manual `workflow_dispatch` always sends for real (bypasses the gate)
 #     and updates the state file.
 #   - Scheduled workflows run ONLY on the default branch.
+#
+# Resilience:
+#   - CLI versions are pinned (see env below) so an upstream release can't
+#     silently break a flag this workflow depends on. Bump deliberately.
+#   - The warm-up call itself retries up to 3x with a short backoff, so a
+#     transient network/API blip doesn't count as a real failure or wake
+#     anyone up for nothing.
+#   - If a job still fails after retries (e.g. a subscription token was
+#     genuinely revoked), the `notify` job opens a single GitHub issue with
+#     the exact recovery commands. GitHub emails repo owners on new issues
+#     by default, so you find out without watching the Actions tab. Once a
+#     later run succeeds again, that issue is auto-closed.
 
 on:
   schedule:
     - cron: "*/30 * * * *"   # every 30 min, 24/7 — the elapsed-time gate limits real sends to ~5/day
   workflow_dispatch:           # manual "Run workflow" button - always sends for real
 
-# Least privilege by default; jobs that commit state elevate to write.
+# Least privilege by default; jobs that need more elevate individually.
 permissions:
   contents: read
 
@@ -44,6 +56,10 @@ env:
   # never land inside the previous still-active window (which would be wasted
   # and would NOT start a new window).
   WARM_INTERVAL_SECONDS: "18060"
+  # Pinned CLI versions - last verified working. Bump intentionally, not
+  # silently via an unpinned `npm install -g <pkg>@latest`.
+  CLAUDE_CLI_VERSION: "2.1.205"
+  CODEX_CLI_VERSION: "0.143.0"
 
 jobs:
   # --------------------------------------------------------------------------
@@ -79,15 +95,20 @@ jobs:
 
       - name: Install Claude Code CLI
         if: steps.check.outputs.send == 'true'
-        run: npm install -g @anthropic-ai/claude-code
+        run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CLI_VERSION}"
 
       - name: Send warm-up prompt
         if: steps.check.outputs.send == 'true'
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
-          claude -p "hi" \
-            --model claude-haiku-4-5-20251001
+          for i in 1 2 3; do
+            claude -p "hi" --model claude-haiku-4-5-20251001 && exit 0
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+          echo "All 3 attempts failed."
+          exit 1
 
       - name: Record warm timestamp
         if: steps.check.outputs.send == 'true'
@@ -109,7 +130,7 @@ jobs:
   # auth.json back to the secret after the run so cron keeps working.
   # This write-back needs a PAT (secret GH_PAT) with 'secrets: write'.
   # Without GH_PAT the run still works, but you may need to re-login and
-  # update CODEX_AUTH_JSON manually every few days.
+  # update CODEX_AUTH_JSON manually every so often.
   # --------------------------------------------------------------------------
   warm-codex:
     runs-on: ubuntu-latest
@@ -141,7 +162,7 @@ jobs:
 
       - name: Install Codex CLI
         if: steps.check.outputs.send == 'true'
-        run: npm install -g @openai/codex
+        run: npm install -g "@openai/codex@${CODEX_CLI_VERSION}"
 
       - name: Restore Codex auth
         if: steps.check.outputs.send == 'true'
@@ -155,11 +176,14 @@ jobs:
       - name: Send warm-up prompt
         if: steps.check.outputs.send == 'true'
         run: |
-          codex exec \
-            --skip-git-repo-check \
-            -m gpt-5.4-mini \
-            -c model_reasoning_effort="low" \
-            "hi"
+          for i in 1 2 3; do
+            codex exec --skip-git-repo-check -m gpt-5.4-mini \
+              -c model_reasoning_effort="low" "hi" && exit 0
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+          echo "All 3 attempts failed."
+          exit 1
 
       - name: Persist refreshed auth back to secret (best-effort)
         if: ${{ steps.check.outputs.send == 'true' && env.GH_PAT != '' }}
@@ -186,6 +210,72 @@ jobs:
             git pull --rebase --autostash && git push && break
             sleep $((RANDOM % 5 + 1))
           done
+
+  # --------------------------------------------------------------------------
+  # Notify — the only time you should ever need to look at this repo. If a
+  # warm job fails (all 3 retries exhausted - a real auth/CLI problem, not a
+  # blip), open one GitHub issue with the exact fix. GitHub emails repo
+  # owners on new issues/comments by default, so this reaches you without
+  # anyone polling Actions. Once things succeed again, auto-close it.
+  # --------------------------------------------------------------------------
+  notify:
+    needs: [warm-claude, warm-codex]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      CLAUDE_FAILED: ${{ needs.warm-claude.result == 'failure' }}
+      CODEX_FAILED: ${{ needs.warm-codex.result == 'failure' }}
+    steps:
+      - name: Open or update failure issue
+        if: env.CLAUDE_FAILED == 'true' || env.CODEX_FAILED == 'true'
+        run: |
+          title="Warm-up needs attention"
+          existing=$(gh issue list --repo "$REPO" --state open --json number,title \
+            --jq '[.[] | select(.title=="'"$title"'")][0].number // empty')
+
+          body="Automated warm-up failed after 3 retries. Failed run: $RUN_URL"$'\n\n'
+
+          if [ "$CLAUDE_FAILED" = "true" ]; then
+            body+="### Claude"$'\n'
+            body+='Likely an expired/revoked OAuth token. Fix (run in your own terminal):'$'\n'
+            body+='```bash'$'\n'
+            body+='claude setup-token'$'\n'
+            body+="gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo $REPO"$'\n'
+            body+='```'$'\n\n'
+          fi
+
+          if [ "$CODEX_FAILED" = "true" ]; then
+            body+="### Codex"$'\n'
+            body+='Likely a revoked refresh token (OpenAI has no long-lived CI credential). Fix (run in your own terminal, or use the Codex desktop app to sign in, then run the second command):'$'\n'
+            body+='```bash'$'\n'
+            body+='codex login'$'\n'
+            body+="gh secret set CODEX_AUTH_JSON --repo $REPO < ~/.codex/auth.json"$'\n'
+            body+='```'$'\n\n'
+          fi
+
+          body+="This issue will auto-close the next time both jobs succeed."
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+          else
+            gh issue create --repo "$REPO" --title "$title" --body "$body"
+          fi
+
+      - name: Close resolved failure issue
+        if: env.CLAUDE_FAILED == 'false' && env.CODEX_FAILED == 'false'
+        run: |
+          title="Warm-up needs attention"
+          existing=$(gh issue list --repo "$REPO" --state open --json number,title \
+            --jq '[.[] | select(.title=="'"$title"'")][0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue close "$existing" --repo "$REPO" \
+              --comment "Resolved - a subsequent run succeeded. Closing automatically."
+          fi
 
   # --------------------------------------------------------------------------
   # Heartbeat — keeps the repo "active" so GitHub never auto-disables the
