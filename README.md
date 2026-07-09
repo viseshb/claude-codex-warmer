@@ -38,7 +38,8 @@ four jobs:
 | `notify`     | If a warm job genuinely fails, opens one GitHub issue with the exact fix commands (GitHub emails you); auto-closes it once runs succeed again |
 | `heartbeat`  | Commits a timestamp once per day so GitHub never auto-disables the schedule (see FAQ) |
 
-The cron triggers every 30 minutes, 24/7. Each warm job reads a committed
+The cron triggers every 30 minutes, 24/7 (at :07 and :37, deliberately off
+the congested :00/:30 marks where GitHub delays cron jobs the most). Each warm job reads a committed
 state file (`.state/<provider>-last-warm.txt`, epoch seconds) and only sends
 for real once the previous warm is **more than 5 h 01 m old** - i.e. strictly
 after the previous window has expired. Every other trigger is a ~5-second
@@ -147,7 +148,7 @@ entry on wrong-account tokens.
   = 5 h 01 m). Don't set it below your provider's window length: a send that
   lands inside a still-active window is wasted and breaks the chain.
 - **Quiet hours** - to skip overnight warms, narrow the cron (e.g.
-  `*/30 12-23,0-4 * * *` ≈ 7 AM–11 PM US Central; GitHub cron is UTC). The
+  `7,37 12-23,0-4 * * *` ≈ 7 AM–11 PM US Central; GitHub cron is UTC). The
   elapsed-time gate self-corrects whenever triggers resume. The trade-off:
   your first window of the day starts at the first morning trigger instead of
   already running from overnight.

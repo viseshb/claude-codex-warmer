@@ -44,7 +44,10 @@ name: warm-usage-windows
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # every 30 min, 24/7 — the elapsed-time gate limits real sends to ~5/day
+    # Every 30 min, 24/7 — the elapsed-time gate limits real sends to ~5/day.
+    # Offset from :00/:30 on purpose: those are GitHub's most congested cron
+    # minutes and jobs scheduled there get delayed/skipped the most.
+    - cron: "7,37 * * * *"
   workflow_dispatch:           # manual "Run workflow" button - always sends for real
 
 # Least privilege by default; jobs that need more elevate individually.
