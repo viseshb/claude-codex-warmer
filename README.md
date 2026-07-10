@@ -34,20 +34,28 @@ four jobs:
 | Job          | What it does |
 |--------------|--------------|
 | `warm-claude`| Installs the Claude Code CLI, sends `"hi"` to `claude-haiku-4-5` using your subscription OAuth token |
-| `warm-codex` | Installs the Codex CLI, restores your ChatGPT login, sends `"hi"` to `gpt-5.4-mini` at low reasoning effort |
+| `warm-codex` | Installs the Codex CLI, restores your ChatGPT login, sends `"hi"` to `gpt-5.6-sol` at low reasoning effort (NOT the mini model - see FAQ) |
 | `notify`     | If a warm job genuinely fails, opens one GitHub issue with the exact fix commands (GitHub emails you); auto-closes it once runs succeed again |
 | `heartbeat`  | Commits a timestamp once per day so GitHub never auto-disables the schedule (see FAQ) |
 
 The cron triggers every 30 minutes, 24/7 (at :07 and :37, deliberately off
-the congested :00/:30 marks where GitHub delays cron jobs the most). Each warm job reads a committed
-state file (`.state/<provider>-last-warm.txt`, epoch seconds) and only sends
-for real once the previous warm is **more than 5 h 01 m old** - i.e. strictly
-after the previous window has expired. Every other trigger is a ~5-second
-no-op (checkout + one date comparison; nothing installed, no API call).
+the congested :00/:30 marks where GitHub delays cron jobs the most). Each
+warm job then asks the **account's own usage meter** (the same API your apps
+read) whether a 5-hour window is already running:
 
-The 1-minute margin matters: a message sent *before* the current window
-expires just counts inside it and does **not** start a new window - it would
-be a wasted send that silently breaks the chain.
+- Window active: skip. This includes windows **you** started yourself from
+  any device - the meter sees them, so the warm-up never wastes a send
+  inside them.
+- No window: send one `"hi"`, which starts a fresh window.
+
+If the usage endpoint is ever unreachable, the job falls back to a committed
+state file (`.state/<provider>-last-warm.txt`, epoch seconds) and only sends
+once its own previous warm is more than 5 h 01 m old. Either way, a skipped
+trigger is a cheap no-op.
+
+Why never send into an active window: a message sent *before* the current
+window expires just counts inside it and does **not** start a new window -
+it would be a wasted send.
 
 Manually triggering the workflow (**Actions → warm-usage-windows → Run
 workflow**) always sends for real regardless of timing - that's your
@@ -152,9 +160,11 @@ entry on wrong-account tokens.
   elapsed-time gate self-corrects whenever triggers resume. The trade-off:
   your first window of the day starts at the first morning trigger instead of
   already running from overnight.
-- **Models** - the warm-up uses the cheapest model on each side
-  (`claude-haiku-4-5`, `gpt-5.4-mini` at low reasoning effort). Any model
-  works; cheaper just wastes less of your own budget.
+- **Models** - Claude warms with `claude-haiku-4-5` (cheapest, and it counts
+  toward the meter). Codex warms with `gpt-5.6-sol` at low reasoning effort:
+  NOT the cheapest, on purpose. The warm-up model must be one that registers
+  on the account's 5-hour meter, otherwise the send never starts a window
+  (see FAQ).
 - **CLI versions** - pinned via `CLAUDE_CLI_VERSION` and `CODEX_CLI_VERSION`
   in `warm.yml`. To upgrade, bump the pin, run a manual test
   (`gh workflow run warm.yml`), and confirm it's green before walking away.
@@ -167,11 +177,26 @@ entry on wrong-account tokens.
 ## FAQ / Troubleshooting
 
 **Every run is green but my window is never warm.**
-Your token was almost certainly minted from a different account than the one
-your apps use (multiple Google logins are the classic cause). The runs really
-are sending - to the wrong account, which no log can show you. Re-mint the
-secret from a terminal where the CLI is logged into the account you actually
-use (step 2), then re-verify (step 4).
+Two known causes:
+
+1. *Wrong account.* Your token was minted from a different account than the
+   one your apps use (multiple Google logins are the classic cause). The runs
+   really are sending - to the wrong account, which no log can show you.
+   Re-mint the secret from a terminal where the CLI is logged into the
+   account you actually use (step 2), then re-verify (step 4).
+2. *A model that does not touch the meter.* This project originally warmed
+   Codex with `gpt-5.4-mini` to save tokens. The sends succeeded, returned
+   replies, and reported token usage - and never started a single window,
+   because mini-model usage bills a separate bucket that does not register
+   on the account's 5-hour meter. If you change the warm-up model, verify a
+   send actually pins your reset time before trusting it.
+
+**How do I know this isn't happening to me right now?**
+The gate itself is the canary: it reads your live meter every trigger and
+logs either "window active (resets in Ns)" or "no active window - warming".
+If runs keep logging "no active window" every 30 minutes, sends are not
+registering and the safety floor is limiting the damage - check the model
+and the account.
 
 **Why is there sometimes a short gap right after a window expires?**
 GitHub's cron is best-effort - on low-traffic repos, triggers regularly land
@@ -228,9 +253,11 @@ warmed account (desktop, phone, web, CLI) sees the same running window.
 ## Extending to other providers
 
 Copy the `warm-claude` job: install the provider's CLI (pinned version),
-restore its auth from a secret, reuse the elapsed-time gate against a new
-`.state/<provider>-last-warm.txt`, and add the job to the `needs:` lists of
-`notify` and `heartbeat`. Any assistant with a headless CLI and subscription
+restore its auth from a secret, adapt the gate (query the provider's usage
+endpoint if it has one; otherwise use the elapsed-time fallback against a new
+`.state/<provider>-last-warm.txt`), and add the job to the `needs:` lists of
+`notify` and `heartbeat`. Verify a warm send actually pins the account's
+reset time - a green run alone proves nothing (see FAQ). Any assistant with a headless CLI and subscription
 auth fits the pattern.
 
 ---

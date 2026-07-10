@@ -17,12 +17,16 @@ name: warm-usage-windows
 #   - Codex:  CODEX_AUTH_JSON          (contents of ~/.codex/auth.json after `codex login`)
 #
 # Scheduling mechanics:
-#   - Cron fires every 30 min all day. Each job reads a committed per-provider
-#     epoch-seconds state file and only sends for real once the last warm is
-#     more than 5h01m old — i.e. strictly AFTER the previous window expired.
-#     (Sending BEFORE expiry would be worse than useless: the message lands
-#     inside the still-active window and does NOT start a new one, so the
-#     chain would silently break.) Every other trigger is a ~5s no-op.
+#   - Cron fires every 30 min all day. Each job first asks the ACCOUNT'S OWN
+#     usage meter (the same API the apps read) whether a 5h window is already
+#     running: if yes, skip; if cold, send. This respects windows the user
+#     started themselves, which no local bookkeeping can know about.
+#   - Fallback: if the usage endpoint is unreachable or changes shape, the
+#     job falls back to the committed per-provider epoch-seconds state file
+#     and only sends once the last warm is more than 5h01m old. The state
+#     file is also kept as an audit trail of every real send.
+#     (Sending while a window is active is worse than useless: the message
+#     lands inside the still-active window and does NOT start a new one.)
 #   - GitHub cron is best-effort and often late on low-traffic repos; with an
 #     elapsed-time gate that's harmless — the first run that lands after
 #     expiry re-warms, and the chain self-corrects.
@@ -55,10 +59,16 @@ permissions:
   contents: read
 
 env:
-  # Minimum seconds between real warms: 5h + 1min safety margin, so a send can
-  # never land inside the previous still-active window (which would be wasted
-  # and would NOT start a new window).
+  # Fallback-gate minimum seconds between real warms: 5h + 1min safety margin,
+  # so a send can never land inside the previous still-active window (which
+  # would be wasted and would NOT start a new window). Only used when the live
+  # usage meter is unreachable.
   WARM_INTERVAL_SECONDS: "18060"
+  # Safety floor: if the live meter claims "cold" less than this many seconds
+  # after our own last send, distrust it and skip. A real window lasts 5h, so
+  # this can never block a legitimate re-warm; it only stops a broken meter
+  # (or a model that doesn't register on it) from causing a send every 30 min.
+  MIN_REWARM_SECONDS: "3600"
   # Pinned CLI versions - last verified working. Bump intentionally, not
   # silently via an unpinned `npm install -g <pkg>@latest`.
   CLAUDE_CLI_VERSION: "2.1.205"
@@ -75,21 +85,63 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check if previous window still active
+      - name: Check if a window is already running
         id: check
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
+          send=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual run - sending regardless of window state."
+            send=true
+          fi
+
           now=$(date +%s)
           last=$(cat .state/claude-last-warm.txt 2>/dev/null || echo 0)
           # Legacy state files stored a YYYY-MM-DD date; treat anything
           # non-numeric as "never warmed".
           case "$last" in (''|*[!0-9]*) last=0 ;; esac
           elapsed=$(( now - last ))
-          if [ "${{ github.event_name }}" = "schedule" ] && [ "$elapsed" -lt "$WARM_INTERVAL_SECONDS" ]; then
-            echo "Claude window still active (warmed ${elapsed}s ago, < ${WARM_INTERVAL_SECONDS}s) - skipping."
-            echo "send=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "send=true" >> "$GITHUB_OUTPUT"
+
+          # Primary gate: the account's real usage meter. It knows about
+          # windows started from ANY device, not just our own sends.
+          if [ -z "$send" ]; then
+            usage=$(curl -sf --max-time 30 https://api.anthropic.com/api/oauth/usage \
+              -H "Authorization: Bearer $CLAUDE_CODE_OAUTH_TOKEN" \
+              -H "anthropic-beta: oauth-2025-04-20" || true)
+            if printf '%s' "$usage" | jq -e '.five_hour' >/dev/null 2>&1; then
+              resets_at=$(printf '%s' "$usage" | jq -r '.five_hour.resets_at // empty')
+              case "$resets_at" in
+                ('') reset_epoch=0 ;;
+                (*[!0-9]*) reset_epoch=$(date -u -d "$resets_at" +%s 2>/dev/null || echo 0) ;;
+                (*) reset_epoch=$resets_at ;;
+              esac
+              if [ "$reset_epoch" -gt "$now" ]; then
+                echo "Live meter: window active until $resets_at - skipping."
+                send=false
+              elif [ "$elapsed" -lt "$MIN_REWARM_SECONDS" ]; then
+                echo "Live meter says cold but we sent ${elapsed}s ago - skipping (safety floor)."
+                send=false
+              else
+                echo "Live meter: no active window - warming."
+                send=true
+              fi
+            else
+              echo "Live meter unavailable - falling back to state file."
+            fi
           fi
+
+          # Fallback gate: our own last-send timestamp.
+          if [ -z "$send" ]; then
+            if [ "$elapsed" -lt "$WARM_INTERVAL_SECONDS" ]; then
+              echo "State file: warmed ${elapsed}s ago (< ${WARM_INTERVAL_SECONDS}s) - skipping."
+              send=false
+            else
+              echo "State file: last warm ${elapsed}s ago - warming."
+              send=true
+            fi
+          fi
+          echo "send=$send" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@v4
         if: steps.check.outputs.send == 'true'
@@ -144,19 +196,64 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check if previous window still active
+      - name: Restore Codex auth
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+        run: |
+          mkdir -p "$HOME/.codex"
+          printf '%s' "$CODEX_AUTH_JSON" > "$HOME/.codex/auth.json"
+          chmod 600 "$HOME/.codex/auth.json"
+
+      - name: Check if a window is already running
         id: check
         run: |
+          send=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual run - sending regardless of window state."
+            send=true
+          fi
+
           now=$(date +%s)
           last=$(cat .state/codex-last-warm.txt 2>/dev/null || echo 0)
           case "$last" in (''|*[!0-9]*) last=0 ;; esac
           elapsed=$(( now - last ))
-          if [ "${{ github.event_name }}" = "schedule" ] && [ "$elapsed" -lt "$WARM_INTERVAL_SECONDS" ]; then
-            echo "Codex window still active (warmed ${elapsed}s ago, < ${WARM_INTERVAL_SECONDS}s) - skipping."
-            echo "send=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "send=true" >> "$GITHUB_OUTPUT"
+
+          # Primary gate: the account's real usage meter. When nothing has
+          # been metered recently, reset_after_seconds sits at the full
+          # window length and slides forward; an active window pins it lower.
+          if [ -z "$send" ]; then
+            usage=$(curl -sf --max-time 30 https://chatgpt.com/backend-api/wham/usage \
+              -H "Authorization: Bearer $(jq -r '.tokens.access_token' "$HOME/.codex/auth.json")" \
+              -H "chatgpt-account-id: $(jq -r '.tokens.account_id' "$HOME/.codex/auth.json")" || true)
+            if printf '%s' "$usage" | jq -e '.rate_limit.primary_window.reset_after_seconds' >/dev/null 2>&1; then
+              reset_after=$(printf '%s' "$usage" | jq -r '.rate_limit.primary_window.reset_after_seconds')
+              window=$(printf '%s' "$usage" | jq -r '.rate_limit.primary_window.limit_window_seconds // 18000')
+              if [ "$reset_after" -lt $((window - 120)) ]; then
+                echo "Live meter: window active (resets in ${reset_after}s) - skipping."
+                send=false
+              elif [ "$elapsed" -lt "$MIN_REWARM_SECONDS" ]; then
+                echo "Live meter says cold but we sent ${elapsed}s ago - skipping (safety floor)."
+                send=false
+              else
+                echo "Live meter: no active window - warming."
+                send=true
+              fi
+            else
+              echo "Live meter unavailable - falling back to state file."
+            fi
           fi
+
+          # Fallback gate: our own last-send timestamp.
+          if [ -z "$send" ]; then
+            if [ "$elapsed" -lt "$WARM_INTERVAL_SECONDS" ]; then
+              echo "State file: warmed ${elapsed}s ago (< ${WARM_INTERVAL_SECONDS}s) - skipping."
+              send=false
+            else
+              echo "State file: last warm ${elapsed}s ago - warming."
+              send=true
+            fi
+          fi
+          echo "send=$send" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@v4
         if: steps.check.outputs.send == 'true'
@@ -167,20 +264,15 @@ jobs:
         if: steps.check.outputs.send == 'true'
         run: npm install -g "@openai/codex@${CODEX_CLI_VERSION}"
 
-      - name: Restore Codex auth
-        if: steps.check.outputs.send == 'true'
-        env:
-          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
-        run: |
-          mkdir -p "$HOME/.codex"
-          printf '%s' "$CODEX_AUTH_JSON" > "$HOME/.codex/auth.json"
-          chmod 600 "$HOME/.codex/auth.json"
-
       - name: Send warm-up prompt
         if: steps.check.outputs.send == 'true'
         run: |
+          # NOT the mini model: gpt-5.4-mini bills a separate bucket and does
+          # not register on the account's 5h window meter at all, so a mini
+          # "hi" never starts a window (verified empirically 2026-07-10).
+          # The warm must use the same metered model the apps use.
           for i in 1 2 3; do
-            codex exec --skip-git-repo-check -m gpt-5.4-mini \
+            codex exec --skip-git-repo-check -m gpt-5.6-sol \
               -c model_reasoning_effort="low" "hi" && exit 0
             echo "Attempt $i failed, retrying in 10s..."
             sleep 10
