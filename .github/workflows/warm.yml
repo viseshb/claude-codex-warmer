@@ -346,10 +346,11 @@ jobs:
 
           if [ "$CODEX_FAILED" = "true" ]; then
             body+="### Codex"$'\n'
-            body+='Likely a revoked refresh token (OpenAI has no long-lived CI credential). Fix (run in your own terminal, or use the Codex desktop app to sign in, then run the second command):'$'\n'
+            body+='Likely a revoked refresh token (OpenAI has no long-lived CI credential). Fix (run in your own terminal). The SECOND login is required: it gives your machine its own session so it cannot refresh-race the one you just uploaded for CI:'$'\n'
             body+='```bash'$'\n'
             body+='codex login'$'\n'
             body+="gh secret set CODEX_AUTH_JSON --repo $REPO < ~/.codex/auth.json"$'\n'
+            body+='codex login'$'\n'
             body+='```'$'\n\n'
           fi
 

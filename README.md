@@ -114,7 +114,16 @@ gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo <you>/<repo>
 # Codex - run in YOUR terminal (opens a browser; log in with the right account)
 codex login
 gh secret set CODEX_AUTH_JSON --repo <you>/<repo> < ~/.codex/auth.json
+codex login   # yes, AGAIN - see below
 ```
+
+The second `codex login` is not a typo. Each login mints an independent
+OAuth session, and the secret must hold a session that **only CI uses**. If
+your local CLI keeps using the same session you uploaded, the two sides
+refresh-race the same rotating token and the CI login dies within days with
+"refresh token was already used" (ours lasted 8 days). Logging in again
+gives your machine its own fresh session and leaves the uploaded one
+exclusively to CI.
 
 PowerShell equivalent for the Codex line (no `<` redirection):
 
@@ -128,7 +137,7 @@ for an OAuth callback, so they hang inside CI shells or agent sessions.
 | Secret                    | Required | Notes |
 |---------------------------|----------|-------|
 | `CLAUDE_CODE_OAUTH_TOKEN` | for Claude | From `claude setup-token`. Valid ~1 year. |
-| `CODEX_AUTH_JSON`         | for Codex  | Contents of `~/.codex/auth.json` after `codex login`. Can expire - see FAQ. |
+| `CODEX_AUTH_JSON`         | for Codex  | Contents of `~/.codex/auth.json` after `codex login`. Must be a CI-exclusive session (log in again afterwards). Can expire - see FAQ. |
 | `GH_PAT`                  | optional   | Fine-grained PAT with **Secrets: read/write** on this repo; lets the Codex job write its refreshed token back so the login survives rotation. |
 
 ### 3. Test it
@@ -214,13 +223,22 @@ itself on the next successful run. No dashboard-watching required.
 
 **Codex suddenly stopped warming (401 errors).**
 OpenAI has no official CI token for Codex, so this repo restores
-`~/.codex/auth.json` from a secret. That file holds a refresh token which the
-OAuth server may rotate or revoke; on an ephemeral runner a rotated token is
-lost unless written back. Set the optional `GH_PAT` secret to enable
-automatic write-back - without it, this failure is a matter of time (ours
-died after ~30 hours). When it does break: re-run `codex login` locally and
-update `CODEX_AUTH_JSON` (the failure issue contains these exact commands).
-The Claude path doesn't have this problem - `claude setup-token` exists
+`~/.codex/auth.json` from a secret. That file holds a rotating refresh
+token, which creates two distinct ways to die:
+
+1. *No write-back.* On an ephemeral runner a rotated token is lost unless
+   written back to the secret. Set the optional `GH_PAT` secret to enable
+   automatic write-back - without it, this failure is a matter of time
+   (ours died after ~30 hours).
+2. *Shared session.* If anything on your own machine (the codex CLI, the
+   VS Code extension, a usage widget) still uses the session you uploaded,
+   it and CI refresh-race the same token chain until one side gets
+   "refresh token was already used" (ours died after 8 days this way).
+   The secret must hold a session only CI uses: `codex login`, upload,
+   then `codex login` again locally.
+
+When it does break: the failure issue contains the exact recovery commands.
+The Claude path doesn't have either problem - `claude setup-token` exists
 precisely for headless use.
 
 **"hi" cost 4,577 tokens?!**
